@@ -14,6 +14,13 @@ integration, which has the same `fish_audio` domain and overrides the core one w
 - **Instant short openers.** A reply's first sentence of 30 characters or fewer ("Sure.", "On it.") is stored
   once in `/config/fish_ack_cache` and replayed from disk, so it starts with no Fish delay. The standard
   phrases are generated at start-up; any other short opener is cached the first time it is used.
+- **Raw PCM in a WAV wrapper.** Audio is streamed as 16-bit mono PCM (44.1 kHz) behind a WAV header of unknown
+  length. HA's ffmpeg probes WAV immediately, but waits for about 4 s of audio before emitting anything from a short
+  mp3 stream, which held a one-second opener back until the real answer arrived. The stream is paced to real time
+  (a few seconds ahead), and short pieces of near-silence are added if the speaker is about to run out of audio
+  while the answer is still being written. Note that some firmware also holds the end of a short clip until more
+  audio follows (see ESPHome micro-decoder before 0.3, which blocks on a full 8 KB read); digital silence compresses
+  to almost nothing in FLAC so it cannot flush that, which needs a firmware fix.
 - **Paid-model fallback.** If a `*-free` model errors or is retired, the integration uses `s2.1-pro` for five
   minutes instead of going silent (this costs money, about $15 per million UTF-8 bytes).
 - **More options.** Speed, output format (mp3/opus/wav), MP3/Opus bitrate and chunk length, as well as

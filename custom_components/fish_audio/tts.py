@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import os
+import struct
 import time
 from collections.abc import AsyncGenerator
 import logging
@@ -52,6 +53,15 @@ PARALLEL_UPDATES = 1
 MAX_CONCURRENT_SYNTHESIS = 2
 # Short opening sentences ("Sure.") are stored once and replayed from disk, so they are heard with no Fish delay.
 ACK_MAX_CHARS = 30
+# Streamed audio is raw 16-bit mono PCM at 44.1 kHz wrapped in a WAV header of unknown length. HA's ffmpeg
+# probes WAV instantly, but waits for ~4 s of audio before it emits anything from a short mp3 stream.
+PCM_RATE = 44100
+PACE_LEAD = 4.0  # seconds of audio allowed ahead of real time
+KEEPALIVE_MARGIN = 0.25  # send silence when less than this much audio is left queued in the speaker
+SILENCE = bytes(2 * PCM_RATE // 10)  # 100 ms
+WAV_HEADER = (b"RIFF" + struct.pack("<I", 0xFFFFFFFF) + b"WAVEfmt "
+              + struct.pack("<IHHIIHH", 16, 1, 1, PCM_RATE, PCM_RATE * 2, 2, 16)
+              + b"data" + struct.pack("<I", 0xFFFFFFFF))
 # If the free model errors or is retired, use this paid model for a while instead of going silent.
 PAID_FALLBACK_MODEL = "s2.1-pro"
 FREE_COOLDOWN_SECONDS = 300
@@ -120,6 +130,13 @@ class FishAudioTTSEntity(TextToSpeechEntity):
     def supported_languages(self) -> list[str]:
         """Return a list of supported languages."""
         return TTS_SUPPORTED_LANGUAGES
+
+    def _stream_params(self, options: dict[str, Any]) -> dict[str, Any]:
+        """Parameters for the streaming path: same as the configured ones but raw PCM audio."""
+        params = self._resolve_params(options)
+        params["format"] = "pcm"
+        params["config"] = params["config"].model_copy(update={"format": "pcm"})
+        return params
 
     def _free_failed(self, err: Exception) -> None:
         """Remember that the free model failed, so the next requests go straight to the paid one."""
@@ -228,7 +245,7 @@ class FishAudioTTSEntity(TextToSpeechEntity):
 
         async def pregen() -> None:
             try:
-                params = self._resolve_params({})
+                params = self._stream_params({})
             except Exception:  # noqa: BLE001
                 return
             for phrase in ACK_PHRASES:
@@ -285,8 +302,54 @@ class FishAudioTTSEntity(TextToSpeechEntity):
     ) -> TTSAudioResponse:
         """Generate speech from an incoming stream of text."""
         # Validate up front so configuration errors surface before streaming starts.
-        params = self._resolve_params(request.options)
-        return TTSAudioResponse(params["format"], self._stream_audio(request, params))
+        params = self._stream_params(request.options)
+        return TTSAudioResponse("wav", self._wav_stream(request, params))
+
+    async def _wav_stream(
+        self, request: TTSAudioRequest, params: dict[str, Any]
+    ) -> AsyncGenerator[bytes]:
+        """Prefix the PCM stream with a WAV header."""
+        yield WAV_HEADER
+        # Keep-alive: once audio has started, a stall in the source (the answer still being written) would leave the
+        # speaker with an empty buffer and ffmpeg holding back the tail of what it has. Whenever the audio sent so far
+        # is about to be played out, send a short piece of silence instead; real audio is never delayed by more than one piece.
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def pump() -> None:
+            try:
+                async for chunk in self._stream_audio(request, params):
+                    queue.put_nowait(chunk)
+                queue.put_nowait(None)
+            except BaseException as err:  # noqa: BLE001
+                queue.put_nowait(err)
+
+        task = self.hass.async_create_background_task(pump(), "fish_audio_pump")
+        t0 = time.monotonic(); sent = 0.0; started = None; silence = 0.0
+        try:
+            while True:
+                if started is None:
+                    item = await queue.get()
+                else:
+                    ahead = started + sent - time.monotonic()  # seconds of audio the speaker still has queued
+                    try:
+                        item = await asyncio.wait_for(queue.get(), timeout=max(ahead - KEEPALIVE_MARGIN, 0.01))
+                    except TimeoutError:
+                        yield SILENCE
+                        sent += len(SILENCE) / 2 / PCM_RATE; silence += len(SILENCE) / 2 / PCM_RATE
+                        continue
+                if item is None:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                if started is None:
+                    started = time.monotonic()
+                elif (excess := sent - (time.monotonic() - started) - PACE_LEAD) > 0:
+                    await asyncio.sleep(excess)  # source is faster than real time: feed the speaker steadily, not in bursts
+                sent += len(item) / 2 / PCM_RATE
+                yield item
+        finally:
+            task.cancel()
+        _LOGGER.debug("TRACE stream complete t=%.2f audio=%.2fs silence_added=%.2fs", time.monotonic() - t0, sent, silence)
 
     async def _stream_audio(
         self, request: TTSAudioRequest, params: dict[str, Any]
@@ -360,7 +423,7 @@ class FishAudioTTSEntity(TextToSpeechEntity):
             _LOGGER.warning("Fish Audio WebSocket failed (%s), falling back to HTTP", err)
             if str(params["model"]).endswith("-free"):
                 self._free_failed(err)
-                params = self._resolve_params(request.options)
+                params = self._stream_params(request.options)
 
         async def replay():
             for sentence in sentences:
