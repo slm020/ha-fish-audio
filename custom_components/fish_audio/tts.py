@@ -1,12 +1,16 @@
 """TTS platform for the Fish Audio integration."""
 
 import asyncio
+import hashlib
+import os
+import time
 from collections.abc import AsyncGenerator
 import logging
 from typing import Any, override
 
 from fishaudio import TTSConfig
 from fishaudio.exceptions import APIError, RateLimitError
+from fishaudio.types import FlushEvent
 from sentence_stream import SentenceBoundaryDetector
 
 from homeassistant.components.tts import (
@@ -46,6 +50,12 @@ from .error import UnexpectedError
 PARALLEL_UPDATES = 1
 # How many sentences may be synthesised at once (current one + look-ahead).
 MAX_CONCURRENT_SYNTHESIS = 2
+# Short opening sentences ("Sure.") are stored once and replayed from disk, so they are heard with no Fish delay.
+ACK_MAX_CHARS = 30
+# If the free model errors or is retired, use this paid model for a while instead of going silent.
+PAID_FALLBACK_MODEL = "s2.1-pro"
+FREE_COOLDOWN_SECONDS = 300
+ACK_PHRASES = ("Sure.", "On it.", "Right away.", "Sure, one moment.")
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -79,6 +89,9 @@ class FishAudioTTSEntity(TextToSpeechEntity):
         """Initialize the TTS entity."""
         self.client = entry.runtime_data
         self.sub_entry = sub_entry
+        self._ack_mem: dict[str, bytes] = {}
+        self._ack_filling: set[str] = set()
+        self._free_down_until = 0.0
         self._attr_unique_id = sub_entry.subentry_id
         # Configured speed must be a default option so it is part of the TTS cache key.
         self._attr_default_options = {
@@ -108,6 +121,12 @@ class FishAudioTTSEntity(TextToSpeechEntity):
         """Return a list of supported languages."""
         return TTS_SUPPORTED_LANGUAGES
 
+    def _free_failed(self, err: Exception) -> None:
+        """Remember that the free model failed, so the next requests go straight to the paid one."""
+        self._free_down_until = time.monotonic() + FREE_COOLDOWN_SECONDS
+        _LOGGER.warning("Fish free model failed (%s), using %s for %d s",
+                        err, PAID_FALLBACK_MODEL, FREE_COOLDOWN_SECONDS)
+
     def _resolve_params(self, options: dict[str, Any]) -> dict[str, Any]:
         """Validate options and return the keyword arguments for the Fish API."""
         voice_id = options.get(CONF_VOICE_ID, self.sub_entry.data.get(CONF_VOICE_ID))
@@ -133,6 +152,9 @@ class FishAudioTTSEntity(TextToSpeechEntity):
         mp3_bitrate = int(mp3_bitrate)
         opus_bitrate = int(opus_bitrate)
 
+        if (isinstance(backend, str) and backend.endswith("-free")
+                and time.monotonic() < self._free_down_until):
+            backend = PAID_FALLBACK_MODEL
         if voice_id is None:
             raise ServiceValidationError("Voice ID not configured")
         if backend is None:
@@ -181,7 +203,14 @@ class FishAudioTTSEntity(TextToSpeechEntity):
         params = self._resolve_params(options)
 
         try:
-            audio = await self.client.tts.convert(text=message, **params)
+            try:
+                audio = await self.client.tts.convert(text=message, **params)
+            except (RateLimitError, APIError) as err:
+                if not str(params["model"]).endswith("-free"):
+                    raise
+                self._free_failed(err)
+                audio = await self.client.tts.convert(
+                    text=message, **{**params, "model": PAID_FALLBACK_MODEL})
         except RateLimitError as err:
             _LOGGER.error("Fish Audio TTS rate limited: %s", err)
             raise HomeAssistantError(f"Rate limited: {err}") from err
@@ -193,6 +222,63 @@ class FishAudioTTSEntity(TextToSpeechEntity):
 
         return params["format"], audio
 
+    async def async_added_to_hass(self) -> None:
+        """Pre-generate the standard acknowledgement phrases in the background."""
+        await super().async_added_to_hass()
+
+        async def pregen() -> None:
+            try:
+                params = self._resolve_params({})
+            except Exception:  # noqa: BLE001
+                return
+            for phrase in ACK_PHRASES:
+                await self._ack_fill(phrase, params)
+
+        self.hass.async_create_background_task(pregen(), "fish_audio_ack_pregen")
+
+    def _ack_path(self, text: str, params: dict[str, Any]) -> tuple[str, str]:
+        raw = "|".join(str(x) for x in (
+            text.strip(), params["reference_id"], params["model"], params["speed"], params["format"],
+            getattr(params["config"], "mp3_bitrate", None)))
+        key = hashlib.sha1(raw.encode()).hexdigest()[:20]
+        return key, os.path.join(self.hass.config.path("fish_ack_cache"), f"{key}.{params['format']}")
+
+    async def _ack_load(self, text: str, params: dict[str, Any]) -> bytes | None:
+        key, path = self._ack_path(text, params)
+        if key in self._ack_mem:
+            return self._ack_mem[key]
+        def read() -> bytes | None:
+            try:
+                with open(path, "rb") as f:
+                    return f.read()
+            except OSError:
+                return None
+        if (data := await self.hass.async_add_executor_job(read)):
+            self._ack_mem[key] = data
+        return data
+
+    async def _ack_fill(self, text: str, params: dict[str, Any]) -> None:
+        """Synthesize a short phrase once and keep it on disk."""
+        key, path = self._ack_path(text, params)
+        if key in self._ack_mem or key in self._ack_filling:
+            return
+        if await self._ack_load(text, params):
+            return
+        self._ack_filling.add(key)
+        try:
+            audio = await self.client.tts.convert(text=text.strip(), **params)
+            def write() -> None:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(audio)
+            await self.hass.async_add_executor_job(write)
+            self._ack_mem[key] = audio
+            _LOGGER.debug("Cached Fish audio for %r", text)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Could not cache Fish audio for %r: %s", text, err)
+        finally:
+            self._ack_filling.discard(key)
+
     @override
     async def async_stream_tts_audio(
         self, request: TTSAudioRequest
@@ -203,6 +289,92 @@ class FishAudioTTSEntity(TextToSpeechEntity):
         return TTSAudioResponse(params["format"], self._stream_audio(request, params))
 
     async def _stream_audio(
+        self, request: TTSAudioRequest, params: dict[str, Any]
+    ) -> AsyncGenerator[bytes]:
+        """Stream one reply over a single Fish WebSocket, flushing at each sentence.
+
+        The HTTP endpoint only returns audio once the whole text is synthesized;
+        the WebSocket sends audio as it is generated, so the first words are heard
+        after the first sentence rather than after the whole reply. A short first
+        sentence ("Sure.") is replayed from a local cache so it starts instantly.
+        If the socket fails before any audio, fall back to the per-sentence HTTP method.
+        """
+        sentences: list[str] = []  # sentences still to be spoken (used for the HTTP fallback)
+        detector = SentenceBoundaryDetector()
+        source = request.message_gen.__aiter__()
+        consumed_all = False
+
+        async def next_sentences() -> list[str] | None:
+            nonlocal consumed_all
+            while not consumed_all:
+                try:
+                    text_chunk = await source.__anext__()
+                except StopAsyncIteration:
+                    consumed_all = True
+                    rest = detector.finish()
+                    return [rest] if rest and rest.strip() else None
+                if got := [x for x in detector.add_chunk(text_chunk) if x.strip()]:
+                    return got
+            return None
+
+        first = await next_sentences()
+        to_send = first or []
+        if first and len(first[0].strip()) <= ACK_MAX_CHARS:
+            if (cached := await self._ack_load(first[0], params)) is not None:
+                yield cached
+                to_send = first[1:]
+            else:
+                self.hass.async_create_background_task(
+                    self._ack_fill(first[0], params), "fish_audio_ack_fill")
+
+        async def events():
+            pending = list(to_send)
+            while True:
+                for sentence in pending:
+                    sentences.append(sentence)
+                    yield sentence.rstrip() + " "
+                    yield FlushEvent()
+                if not (pending := await next_sentences() or []):
+                    return
+
+        if not to_send and consumed_all:
+            return
+        got_audio = False
+        try:
+            async for chunk in self.client.tts.stream_websocket(
+                events(),
+                reference_id=params["reference_id"],
+                latency=params["latency"],
+                speed=params["speed"],
+                model=params["model"],
+                format=params["format"],
+                config=params["config"],
+            ):
+                got_audio = True
+                yield chunk
+            return
+        except Exception as err:  # noqa: BLE001
+            if got_audio:
+                _LOGGER.error("Fish Audio WebSocket stream failed mid-reply: %s", err)
+                raise
+            _LOGGER.warning("Fish Audio WebSocket failed (%s), falling back to HTTP", err)
+            if str(params["model"]).endswith("-free"):
+                self._free_failed(err)
+                params = self._resolve_params(request.options)
+
+        async def replay():
+            for sentence in sentences:
+                yield sentence
+            if not consumed_all:
+                async for text_chunk in source:
+                    yield text_chunk
+
+        async for chunk in self._stream_audio_http(
+            TTSAudioRequest(request.language, request.options, replay()), params
+        ):
+            yield chunk
+
+    async def _stream_audio_http(
         self, request: TTSAudioRequest, params: dict[str, Any]
     ) -> AsyncGenerator[bytes]:
         """Synthesize sentences concurrently, but yield their audio strictly in order.
@@ -287,9 +459,19 @@ class FishAudioTTSEntity(TextToSpeechEntity):
     ) -> AsyncGenerator[bytes]:
         """Stream the audio for a single piece of text from Fish Audio."""
         _LOGGER.debug("Streaming TTS audio for %s", text)
+        sent = False
         try:
-            async for chunk in await self.client.tts.stream(text=text, **params):
-                yield chunk
+            try:
+                async for chunk in await self.client.tts.stream(text=text, **params):
+                    sent = True
+                    yield chunk
+            except (RateLimitError, APIError) as err:
+                if sent or not str(params["model"]).endswith("-free"):
+                    raise
+                self._free_failed(err)
+                async for chunk in await self.client.tts.stream(
+                        text=text, **{**params, "model": PAID_FALLBACK_MODEL}):
+                    yield chunk
         except RateLimitError as err:
             _LOGGER.error("Fish Audio TTS rate limited: %s", err)
             raise HomeAssistantError(f"Rate limited: {err}") from err
