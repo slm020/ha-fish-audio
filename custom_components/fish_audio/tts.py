@@ -65,7 +65,16 @@ WAV_HEADER = (b"RIFF" + struct.pack("<I", 0xFFFFFFFF) + b"WAVEfmt "
 # If the free model errors or is retired, use this paid model for a while instead of going silent.
 PAID_FALLBACK_MODEL = "s2.1-pro"
 FREE_COOLDOWN_SECONDS = 300
-ACK_PHRASES = ("Sure.", "On it.", "Right away.", "Sure, one moment.")
+# Pre-generated at start-up so they play with no Fish delay. Any other opener of ACK_MAX_CHARS or fewer is cached
+# the first time it is spoken; the phrases themselves come from the conversation agent, not from here.
+ACK_PHRASES = (
+    "Sure.", "On it.", "Right away.", "Sure, one moment.",
+    # typical quick acknowledgements and web-lookup heads-ups
+    "One second.", "Let me think.", "Hmm, hang on.", "Okay, let me see.", "Right, give me a tick..", "Thinking.",
+    "Just checking.", "Hold on.", "Let me see.", "Give me a moment.", "Right, one tick.", "Bear with me.",
+    "Hang on a sec.", "Okay, okay.", "Working on it.",
+    "Searching, may take a while.", "Looking it up, may take a bit.", "Checking online, takes a bit.",
+)
 _LOGGER = logging.getLogger(__name__)
 
 

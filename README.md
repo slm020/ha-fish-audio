@@ -16,9 +16,11 @@ integration, which has the same `fish_audio` domain and overrides the core one w
   as it is generated, so speech starts after the first sentence instead of after the whole reply. (Fish's HTTP
   streaming endpoint only returns the body once the full text is synthesised, so it cannot do this.) If the
   socket fails before any audio, it falls back to the older per-sentence HTTP method.
-- **Instant short openers.** A reply's first sentence of 30 characters or fewer ("Sure.", "On it.") is stored
-  once in `/config/fish_ack_cache` and replayed from disk, so it starts with no Fish delay. The standard
-  phrases are generated at start-up; any other short opener is cached the first time it is used.
+- **Instant short openers.** Fish does not choose any phrase; the conversation agent does (for example the quick
+  acknowledgements in a voice assistant setup). If the first sentence of a reply is 30 characters or fewer, its audio
+  is stored once in `/config/fish_ack_cache` and replayed from disk, so it starts with no Fish delay. A built-in list
+  (`ACK_PHRASES` in `tts.py`) is generated at start-up so the common ones are ready; any other short opener is cached
+  the first time it is spoken and is instant from then on. Longer first sentences are not cached.
 - **Raw PCM in a WAV wrapper.** Audio is streamed as 16-bit mono PCM (44.1 kHz) behind a WAV header of unknown
   length. HA's ffmpeg probes WAV immediately, but waits for about 4 s of audio before emitting anything from a short
   mp3 stream, which held a one-second opener back until the real answer arrived. The stream is paced to real time
