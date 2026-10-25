@@ -1,5 +1,10 @@
 # Fish Audio TTS (streaming) for Home Assistant
 
+> [!WARNING]
+> **This is vibe coded and unofficial.** The changes below were written with an AI assistant for one
+> person's home setup. They are lightly tested, come **as is** with no support and no guarantees, and may break your
+> Home Assistant setup. Read the code and back up before using it. Shared in case it is useful to someone.
+
 A custom version of Home Assistant's built-in [Fish Audio](https://www.home-assistant.io/integrations/fish_audio)
 integration, which has the same `fish_audio` domain and overrides the core one when installed in
 `custom_components`.
@@ -43,4 +48,6 @@ Copy `custom_components/fish_audio` into your HA config's `custom_components` fo
 
 ## Credits
 
-This is based on the Home Assistant core `fish_audio` integration (Apache-2.0) by @noambav.
+This is based on the Home Assistant core `fish_audio` integration by @noambav, licensed Apache-2.0 (see `LICENSE`).
+The files were modified as described above. The core integration is the upstream; the changes here could be offered
+to it as a pull request.
