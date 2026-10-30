@@ -376,11 +376,14 @@ class FishAudioTTSEntity(TextToSpeechEntity):
         source = request.message_gen.__aiter__()
         consumed_all = False
 
+        source_lock = asyncio.Lock()
+
         async def next_sentences() -> list[str] | None:
             nonlocal consumed_all
             while not consumed_all:
                 try:
-                    text_chunk = await source.__anext__()
+                    async with source_lock:
+                        text_chunk = await source.__anext__()
                 except StopAsyncIteration:
                     consumed_all = True
                     rest = detector.finish()
